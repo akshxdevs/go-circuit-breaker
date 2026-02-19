@@ -2,57 +2,93 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"go-circuit-breaker/internal/server"
 )
 
-func gracefulShutdown(apiServer *http.Server, done chan bool) {
-	// Create context that listens for the interrupt signal from the OS.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	// Listen for the interrupt signal.
-	<-ctx.Done()
-
-	log.Println("shutting down gracefully, press Ctrl+C again to force")
-	stop() // Allow Ctrl+C to force shutdown
-
-	// The context is used to inform the server it has 5 seconds to finish
-	// the request it is currently handling
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := apiServer.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown with error: %v", err)
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
-
-	log.Println("Server exiting")
-
-	// Notify the main goroutine that the shutdown is complete
-	done <- true
 }
 
-func main() {
+func run() error {
+	apiServer := server.NewServer()
+	shutdownTimeout := envDurationSeconds("SHUTDOWN_TIMEOUT_SEC", 10)
 
-	server := server.NewServer()
+	serverErrCh := make(chan error, 1)
+	go func() {
+		log.Printf("http server starting on %s", apiServer.Addr)
+		err := apiServer.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErrCh <- fmt.Errorf("http server failed: %w", err)
+			return
+		}
+		serverErrCh <- nil
+	}()
 
-	// Create a done channel to signal when the shutdown is complete
-	done := make(chan bool, 1)
+	signalCh := make(chan os.Signal, 2)
+	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signalCh)
 
-	// Run graceful shutdown in a separate goroutine
-	go gracefulShutdown(server, done)
-
-	err := server.ListenAndServe()
-	if err != nil && err != http.ErrServerClosed {
-		panic(fmt.Sprintf("http server error: %s", err))
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			return err
+		}
+		log.Println("http server stopped")
+		return nil
+	case sig := <-signalCh:
+		log.Printf("received %s: starting graceful shutdown (timeout=%s)", sig.String(), shutdownTimeout)
 	}
 
-	// Wait for the graceful shutdown to complete
-	<-done
-	log.Println("Graceful shutdown complete.")
+	apiServer.SetKeepAlivesEnabled(false)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	shutdownErrCh := make(chan error, 1)
+	go func() {
+		shutdownErrCh <- apiServer.Shutdown(shutdownCtx)
+	}()
+
+	select {
+	case sig := <-signalCh:
+		log.Printf("received %s during shutdown: forcing immediate close", sig.String())
+		if err := apiServer.Close(); err != nil {
+			return fmt.Errorf("force close failed: %w", err)
+		}
+	case err := <-shutdownErrCh:
+		if err != nil {
+			return fmt.Errorf("graceful shutdown failed: %w", err)
+		}
+		log.Println("graceful shutdown complete")
+	}
+
+	// Ensure server goroutine has exited before returning.
+	if err := <-serverErrCh; err != nil {
+		return err
+	}
+	return nil
+}
+
+func envDurationSeconds(name string, fallbackSeconds int) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return time.Duration(fallbackSeconds) * time.Second
+	}
+
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return time.Duration(fallbackSeconds) * time.Second
+	}
+	return time.Duration(seconds) * time.Second
 }
