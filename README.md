@@ -1,86 +1,145 @@
-# Project go-circuit-breaker
+# go-circuit-breaker
 
-HTTP API demo that includes a connection-pooled outbound client protected by a circuit breaker.
-It is built to make three behaviors observable:
+Small Go HTTP API that demonstrates connection-pool pressure, connection reuse, and circuit-breaker fast-fail behavior with an outbound `http.Client`.
 
-- Queueing when the connection pool is exhausted
-- Connection reuse vs connection churn
-- Failure detection and circuit breaker fast-fail
+## Overview
 
-## Getting Started
+The service exposes demo endpoints that call back into a simulated upstream handler using a pooled HTTP client wrapped in a circuit breaker. It is designed to make these behaviors easy to observe locally:
 
-These instructions will get you a copy of the project up and running on your local machine for development and testing purposes. See deployment for notes on how to deploy the project on a live system.
+- Queueing when outbound concurrency exceeds `MaxConnsPerHost`
+- Reuse of existing connections versus creation of new ones
+- Circuit-breaker transitions from `closed` to `open` to `half_open`
+- Fast rejection of calls while the breaker is open
 
-## MakeFile
+## Tech Stack
 
-Run build make command with tests
-```bash
-make all
+- Go `1.25.6`
+- Standard library `net/http`
+- `github.com/joho/godotenv/autoload` for optional `.env` loading
+
+## Project Structure
+
+```text
+.
+├── cmd/api/main.go             # API entrypoint and graceful shutdown
+├── internal/server/            # HTTP server setup and demo routes
+└── internal/httpclient/        # Instrumented pooled client and circuit breaker
 ```
 
-Build the application
-```bash
-make build
-```
+## Quick Start
 
-Run the application
+Run the API locally:
+
 ```bash
 make run
 ```
 
-Live reload the application:
+The server listens on `http://localhost:8080` by default.
+
+Basic health check:
+
 ```bash
-make watch
+curl http://localhost:8080/
 ```
 
-Run the test suite:
+Run the full test suite:
+
 ```bash
 make test
 ```
 
-Clean up binary from the last build:
-```bash
-make clean
-```
-
-## Circuit-breaker demo routes
-
-Start the API:
+Build the binary:
 
 ```bash
-make run
+make build
 ```
 
-Reset client/breaker metrics:
+## Configuration
+
+The server auto-loads a local `.env` file if present. All settings are optional.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8080` | HTTP server port |
+| `SHUTDOWN_TIMEOUT_SEC` | `10` | Graceful shutdown timeout |
+| `CLIENT_TIMEOUT_MS` | `4000` | Total timeout for outbound requests |
+| `CLIENT_MAX_IDLE_CONNS` | `10` | Total idle connections in the transport |
+| `CLIENT_MAX_IDLE_CONNS_PER_HOST` | `2` | Idle connections kept per host |
+| `CLIENT_MAX_CONNS_PER_HOST` | `2` | Hard cap on concurrent connections per host |
+| `CLIENT_IDLE_TIMEOUT_MS` | `60000` | Idle connection timeout |
+| `CLIENT_TLS_HANDSHAKE_TIMEOUT_MS` | `10000` | TLS handshake timeout |
+| `CLIENT_EXPECT_CONTINUE_TIMEOUT_MS` | `1000` | `Expect: 100-continue` timeout |
+| `CB_FAILURE_THRESHOLD` | `3` | Consecutive failures required to open the breaker |
+| `CB_OPEN_TIMEOUT_MS` | `3000` | Time spent open before allowing half-open probes |
+| `CB_HALF_OPEN_MAX_PROBES` | `2` | Successful probes required to close the breaker |
+
+## Demo Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Returns `{"message":"Hello World"}` |
+| `GET` | `/demo/upstream` | Simulated upstream with configurable delay and failure mode |
+| `GET` | `/demo/load` | Fires concurrent outbound calls through the pooled client |
+| `GET` | `/demo/stats` | Returns current client and breaker metrics |
+| `POST` | `/demo/reset` | Resets client and breaker metrics |
+
+`/demo/upstream` and `/demo/load` support these query parameters:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `delay_ms` | `100` on `/demo/upstream`, `250` on `/demo/load` | Simulated upstream latency |
+| `fail` | `never` | One of `never`, `always`, `flaky` |
+| `fail_rate` | `0.0` on `/demo/upstream`, `0.3` on `/demo/load` | Used only when `fail=flaky` |
+| `failure_status` | `503` | HTTP status returned on failure |
+| `total` | `20` on `/demo/load` | Number of outbound requests to issue |
+| `concurrency` | `10` on `/demo/load` | Number of workers issuing requests |
+
+## Example Workflow
+
+Reset metrics:
 
 ```bash
 curl -X POST http://localhost:8080/demo/reset
 ```
 
-Run concurrent outbound calls through the pooled client:
+Generate contention in the outbound connection pool:
 
 ```bash
-curl \"http://localhost:8080/demo/load?total=40&concurrency=20&delay_ms=250&fail=never\"
+curl "http://localhost:8080/demo/load?total=40&concurrency=20&delay_ms=250&fail=never"
 ```
 
-Observe queueing and connection reuse metrics:
+Inspect queue wait and connection reuse metrics:
 
 ```bash
 curl http://localhost:8080/demo/stats
 ```
 
-Trigger failures and observe fast-fail:
+Trip the circuit breaker and observe fast-fail behavior:
 
 ```bash
-curl \"http://localhost:8080/demo/load?total=30&concurrency=10&delay_ms=120&fail=always&failure_status=503\"
+curl "http://localhost:8080/demo/load?total=30&concurrency=10&delay_ms=120&fail=always&failure_status=503"
 curl http://localhost:8080/demo/stats
 ```
 
-Useful query parameters for `/demo/load`:
+## Architecture
 
-- `total` total outbound requests (default `20`)
-- `concurrency` worker count (default `10`)
-- `delay_ms` upstream delay per request (default `250`)
-- `fail` one of `never|always|flaky` (default `never`)
-- `fail_rate` used when `fail=flaky` (default `0.3`)
-- `failure_status` HTTP status when failing (default `503`)
+`cmd/api/main.go` starts the HTTP server, handles `SIGINT` and `SIGTERM`, and performs graceful shutdown using `SHUTDOWN_TIMEOUT_SEC`.
+
+`internal/server` registers the demo routes. `/demo/load` issues concurrent requests against `/demo/upstream` on the same server so the connection-pool and breaker behavior can be exercised without external dependencies.
+
+`internal/httpclient` provides:
+
+- An `http.Transport` with explicit pool limits such as `MaxConnsPerHost`
+- Request instrumentation for queue wait time and connection reuse via `httptrace`
+- A circuit breaker with `closed`, `open`, and `half_open` states
+
+## Development Commands
+
+```bash
+make all    # build and test
+make build  # compile cmd/api/main.go to ./main
+make run    # start the API
+make test   # run go test ./... -v
+make clean  # remove ./main
+make watch  # run with air if installed, or prompt to install it
+```
